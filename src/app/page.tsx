@@ -1,6 +1,6 @@
 'use client';
 
-import { trpc } from '@/utils/trpc';
+import { trpc } from './_trpc/client';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { useState } from 'react';
