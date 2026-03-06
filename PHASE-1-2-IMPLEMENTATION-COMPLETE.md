@@ -64,7 +64,7 @@ await Promise.race([uploadPromise, timeoutPromise]);
 
 ### **📁 Storage Structure (Exact Match to Specification):**
 ```
-news-ranking-bucket/
+newsclaw/
 ├── 1772751600000/          // 8am LA on 2026-03-05 (UTC ms)
 │   ├── raw.json           // Raw NewsAPI response
 │   └── summary.json       // 100 scored articles (ready for Phase 3)

@@ -65,7 +65,7 @@ export class NewsStorageService {
       }
     });
 
-    this.bucketName = process.env.S3_BUCKET_NAME || 'news-ranking-bucket';
+    this.bucketName = process.env.S3_BUCKET_NAME || 'newsclaw';
 
     // Validate required environment variables
     if (!process.env.S3_ENDPOINT || !process.env.S3_ACCESS_KEY_ID || !process.env.S3_SECRET_ACCESS_KEY) {
