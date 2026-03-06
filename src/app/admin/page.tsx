@@ -15,6 +15,10 @@ export default function AdminPage() {
   const listDates = trpc.storage.listAvailableDates.useQuery();
   const getSources = trpc.news.getSources.useQuery();
   const getTodayTimestamp = trpc.news.getTodayTimestamp.useQuery();
+  
+  // Scheduler queries
+  const getSchedulerStatus = trpc.scheduler.getStatus.useQuery();
+  const getSchedulerHealth = trpc.scheduler.healthCheck.useQuery();
 
   const fetchNews = trpc.news.fetchDaily.useMutation({
     onSuccess: (data) => {
@@ -37,6 +41,41 @@ export default function AdminPage() {
   const storeRawData = trpc.storage.storeRawData.useMutation({
     onSuccess: (data) => {
       console.log('Storage success:', data);
+      getStorageStats.refetch();
+      listDates.refetch();
+    }
+  });
+
+  const createBucket = trpc.storage.createBucket.useMutation({
+    onSuccess: (data) => {
+      console.log('Bucket creation success:', data);
+      testStorageConnection.refetch();
+      getStorageStats.refetch();
+    },
+    onError: (error) => {
+      console.error('Bucket creation error:', error);
+    }
+  });
+
+  // Scheduler mutations
+  const startScheduler = trpc.scheduler.start.useMutation({
+    onSuccess: (data) => {
+      console.log('Scheduler start success:', data);
+      getSchedulerStatus.refetch();
+    }
+  });
+
+  const stopScheduler = trpc.scheduler.stop.useMutation({
+    onSuccess: (data) => {
+      console.log('Scheduler stop success:', data);
+      getSchedulerStatus.refetch();
+    }
+  });
+
+  const triggerManualScheduler = trpc.scheduler.triggerManual.useMutation({
+    onSuccess: (data) => {
+      console.log('Manual scheduler success:', data);
+      getSchedulerStatus.refetch();
       getStorageStats.refetch();
       listDates.refetch();
     }
@@ -71,6 +110,46 @@ export default function AdminPage() {
       console.error('Manual fetch failed:', error);
     }
     setIsLoading(prev => ({ ...prev, manualFetch: false }));
+  };
+
+  const handleCreateBucket = async () => {
+    setIsLoading(prev => ({ ...prev, createBucket: true }));
+    try {
+      await createBucket.mutateAsync();
+    } catch (error) {
+      console.error('Create bucket failed:', error);
+    }
+    setIsLoading(prev => ({ ...prev, createBucket: false }));
+  };
+
+  const handleStartScheduler = async () => {
+    setIsLoading(prev => ({ ...prev, startScheduler: true }));
+    try {
+      await startScheduler.mutateAsync();
+    } catch (error) {
+      console.error('Start scheduler failed:', error);
+    }
+    setIsLoading(prev => ({ ...prev, startScheduler: false }));
+  };
+
+  const handleStopScheduler = async () => {
+    setIsLoading(prev => ({ ...prev, stopScheduler: true }));
+    try {
+      await stopScheduler.mutateAsync();
+    } catch (error) {
+      console.error('Stop scheduler failed:', error);
+    }
+    setIsLoading(prev => ({ ...prev, stopScheduler: false }));
+  };
+
+  const handleTriggerScheduler = async () => {
+    setIsLoading(prev => ({ ...prev, triggerScheduler: true }));
+    try {
+      await triggerManualScheduler.mutateAsync();
+    } catch (error) {
+      console.error('Trigger scheduler failed:', error);
+    }
+    setIsLoading(prev => ({ ...prev, triggerScheduler: false }));
   };
 
   return (
@@ -130,6 +209,20 @@ export default function AdminPage() {
               {testStorageConnection.error && (
                 <div className="text-sm text-red-600 mt-2">
                   S3 Error: {testStorageConnection.error.message}
+                  <Button 
+                    size="sm" 
+                    className="ml-2"
+                    onClick={handleCreateBucket}
+                    disabled={isLoading.createBucket}
+                  >
+                    {isLoading.createBucket ? '⏳' : '📦'} Create Bucket
+                  </Button>
+                </div>
+              )}
+
+              {createBucket.data && (
+                <div className="text-sm text-green-600 mt-2">
+                  Bucket Result: {createBucket.data.message}
                 </div>
               )}
             </CardContent>
@@ -189,6 +282,83 @@ export default function AdminPage() {
                     ))}
                   </div>
                 </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Scheduler Status & Controls */}
+        <Card>
+          <CardHeader>
+            <CardTitle>⏰ Daily Scheduler (8am LA Time)</CardTitle>
+            <CardDescription>Automated daily news fetching</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {getSchedulerStatus.data && (
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <div className="text-sm text-muted-foreground">Status</div>
+                  <div className={`font-semibold ${getSchedulerStatus.data.status.isScheduled ? 'text-green-600' : 'text-gray-600'}`}>
+                    {getSchedulerStatus.data.status.isScheduled ? '✅ Active' : '⏸️ Stopped'}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-sm text-muted-foreground">Next Run</div>
+                  <div className="font-semibold text-sm">
+                    {getSchedulerStatus.data.status.nextRunLocal || 'Not scheduled'}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div className="flex gap-4">
+              {getSchedulerStatus.data?.status.isScheduled ? (
+                <Button 
+                  variant="outline"
+                  onClick={handleStopScheduler}
+                  disabled={isLoading.stopScheduler}
+                  className="flex items-center gap-2"
+                >
+                  {isLoading.stopScheduler ? '⏳' : '⏹️'} Stop Scheduler
+                </Button>
+              ) : (
+                <Button 
+                  onClick={handleStartScheduler}
+                  disabled={isLoading.startScheduler || !testNewsConnection.data?.success || !testStorageConnection.data?.success}
+                  className="flex items-center gap-2"
+                >
+                  {isLoading.startScheduler ? '⏳' : '▶️'} Start Scheduler
+                </Button>
+              )}
+              
+              <Button 
+                variant="outline"
+                onClick={handleTriggerScheduler}
+                disabled={isLoading.triggerScheduler || !testNewsConnection.data?.success || !testStorageConnection.data?.success}
+                className="flex items-center gap-2"
+              >
+                {isLoading.triggerScheduler ? '⏳' : '🚀'} Run Now (Manual)
+              </Button>
+            </div>
+
+            {getSchedulerStatus.data?.status.lastResult && (
+              <div className={`p-3 rounded-md text-sm ${getSchedulerStatus.data.status.lastResult.success ? 'bg-green-50' : 'bg-red-50'}`}>
+                <strong>Last Scheduled Run:</strong><br/>
+                {getSchedulerStatus.data.status.lastResult.success ? '✅' : '❌'} {getSchedulerStatus.data.status.lastResult.date}<br/>
+                Articles: {getSchedulerStatus.data.status.lastResult.articlesProcessed}<br/>
+                Duration: {getSchedulerStatus.data.status.lastResult.duration}ms
+                {getSchedulerStatus.data.status.lastResult.errors && (
+                  <><br/>Errors: {getSchedulerStatus.data.status.lastResult.errors.join(', ')}</>
+                )}
+              </div>
+            )}
+
+            {triggerManualScheduler.data && (
+              <div className={`p-3 rounded-md text-sm ${triggerManualScheduler.data.result.success ? 'bg-green-50' : 'bg-red-50'}`}>
+                <strong>Manual Run Result:</strong><br/>
+                {triggerManualScheduler.data.message}<br/>
+                Articles: {triggerManualScheduler.data.result.articlesProcessed}<br/>
+                Duration: {triggerManualScheduler.data.result.duration}ms
               </div>
             )}
           </CardContent>

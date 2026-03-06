@@ -169,6 +169,29 @@ export const storageRouter = router({
       }
     }),
 
+  // Create S3 bucket if it doesn't exist
+  createBucket: publicProcedure
+    .mutation(async () => {
+      try {
+        console.log('📦 Creating S3 bucket...');
+        const result = await storageService.createBucketIfNotExists();
+        
+        return {
+          success: true,
+          message: result.created ? 'Bucket created successfully' : 'Bucket already exists',
+          bucketName: process.env.S3_BUCKET_NAME,
+          created: result.created,
+          exists: result.exists
+        };
+      } catch (error) {
+        console.error('❌ Failed to create bucket:', error);
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: `Failed to create bucket: ${error instanceof Error ? error.message : 'Unknown error'}`
+        });
+      }
+    }),
+
   // Get storage statistics
   getStorageStats: publicProcedure
     .query(async () => {

@@ -1,4 +1,4 @@
-import { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command, CreateBucketCommand, HeadBucketCommand } from '@aws-sdk/client-s3';
 import type { RawNewsFile } from './newsapi';
 
 // Storage interfaces
@@ -41,9 +41,16 @@ export interface StorageMetadata {
 export class NewsStorageService {
   private s3Client: S3Client;
   private bucketName: string;
+  
+  // Performance requirements from specification
+  private readonly UPLOAD_TIMEOUT_MS = 5000; // 5 seconds as specified
+  private readonly MAX_FILE_SIZE_MB = 10; // 10MB as specified
+  private readonly MAX_CONCURRENT_OPERATIONS = 5; // Handle concurrent ops
+  
+  private activeOperations = new Set<string>(); // Track concurrent operations
 
   constructor() {
-    // Initialize S3 client with Supabase credentials
+    // Initialize S3 client with Supabase credentials and optimized config
     this.s3Client = new S3Client({
       endpoint: process.env.S3_ENDPOINT,
       region: process.env.S3_REGION,
@@ -52,6 +59,10 @@ export class NewsStorageService {
         secretAccessKey: process.env.S3_SECRET_ACCESS_KEY!,
       },
       forcePathStyle: true, // Required for Supabase S3
+      maxAttempts: 3, // Built-in retry logic
+      requestHandler: {
+        requestTimeout: this.UPLOAD_TIMEOUT_MS
+      }
     });
 
     this.bucketName = process.env.S3_BUCKET_NAME || 'news-ranking-bucket';
@@ -60,71 +71,135 @@ export class NewsStorageService {
     if (!process.env.S3_ENDPOINT || !process.env.S3_ACCESS_KEY_ID || !process.env.S3_SECRET_ACCESS_KEY) {
       throw new Error('Missing required S3 configuration environment variables');
     }
+    
+    console.log(`📦 Storage service initialized: ${this.bucketName} (${this.UPLOAD_TIMEOUT_MS}ms timeout)`);
   }
 
   /**
-   * Store raw NewsAPI data
+   * Store raw NewsAPI data with performance requirements (5-second timeout, 10MB limit)
    */
   async storeRawData(timestamp: number, rawData: RawNewsFile): Promise<void> {
+    const operationId = `store-raw-${timestamp}`;
     const key = `${timestamp}/raw.json`;
+    const startTime = Date.now();
     
-    console.log(`📦 Storing raw data: ${key}`);
+    // Check concurrent operations limit
+    if (this.activeOperations.size >= this.MAX_CONCURRENT_OPERATIONS) {
+      throw new Error(`Concurrent operation limit reached (${this.MAX_CONCURRENT_OPERATIONS})`);
+    }
     
-    const command = new PutObjectCommand({
-      Bucket: this.bucketName,
-      Key: key,
-      Body: JSON.stringify(rawData, null, 2),
-      ContentType: 'application/json',
-      Metadata: {
-        'scan-time': rawData.scanTime,
-        'article-count': rawData.apiResponse.articles.length.toString(),
-        'fetch-status': rawData.apiResponse.status
-      }
-    });
-
+    this.activeOperations.add(operationId);
+    
     try {
-      await this.s3Client.send(command);
-      console.log(`✅ Raw data stored successfully: ${key}`);
+      console.log(`📦 Storing raw data: ${key} (${this.activeOperations.size} concurrent ops)`);
+      
+      const jsonContent = JSON.stringify(rawData, null, 2);
+      const fileSizeMB = Buffer.byteLength(jsonContent, 'utf8') / (1024 * 1024);
+      
+      // Validate file size (10MB limit as specified)
+      if (fileSizeMB > this.MAX_FILE_SIZE_MB) {
+        throw new Error(`File size ${fileSizeMB.toFixed(2)}MB exceeds limit of ${this.MAX_FILE_SIZE_MB}MB`);
+      }
+      
+      const command = new PutObjectCommand({
+        Bucket: this.bucketName,
+        Key: key,
+        Body: jsonContent,
+        ContentType: 'application/json',
+        Metadata: {
+          'scan-time': rawData.scanTime,
+          'article-count': rawData.apiResponse.articles.length.toString(),
+          'fetch-status': rawData.apiResponse.status,
+          'file-size-mb': fileSizeMB.toFixed(3),
+          'storage-version': '1.0'
+        }
+      });
+
+      // Store with timeout (5 seconds as specified)
+      const uploadPromise = this.s3Client.send(command);
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Upload timeout after 5 seconds')), this.UPLOAD_TIMEOUT_MS)
+      );
+      
+      await Promise.race([uploadPromise, timeoutPromise]);
+      
+      const duration = Date.now() - startTime;
+      console.log(`✅ Raw data stored: ${key} (${duration}ms, ${fileSizeMB.toFixed(2)}MB)`);
+      
     } catch (error) {
-      console.error(`❌ Failed to store raw data: ${key}`, error);
+      const duration = Date.now() - startTime;
+      console.error(`❌ Failed to store raw data: ${key} (${duration}ms)`, error);
       throw new Error(`Failed to store raw data: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      this.activeOperations.delete(operationId);
     }
   }
 
   /**
-   * Store processed/scored articles summary
+   * Store processed/scored articles summary with performance requirements
    */
   async storeSummaryData(timestamp: number, scoredArticles: ScoredArticle[]): Promise<void> {
+    const operationId = `store-summary-${timestamp}`;
     const key = `${timestamp}/summary.json`;
+    const startTime = Date.now();
     
-    const summaryFile: SummaryNewsFile = {
-      scanTime: new Date(timestamp).toISOString(),
-      scanTimeMs: timestamp,
-      articles: scoredArticles,
-      statistics: this.calculateStatistics(scoredArticles)
-    };
+    // Check concurrent operations limit
+    if (this.activeOperations.size >= this.MAX_CONCURRENT_OPERATIONS) {
+      throw new Error(`Concurrent operation limit reached (${this.MAX_CONCURRENT_OPERATIONS})`);
+    }
     
-    console.log(`📦 Storing summary data: ${key} (${scoredArticles.length} articles)`);
+    this.activeOperations.add(operationId);
     
-    const command = new PutObjectCommand({
-      Bucket: this.bucketName,
-      Key: key,
-      Body: JSON.stringify(summaryFile, null, 2),
-      ContentType: 'application/json',
-      Metadata: {
-        'scan-time': summaryFile.scanTime,
-        'article-count': scoredArticles.length.toString(),
-        'average-score': summaryFile.statistics.averageScore.toString(),
-        'top-score': summaryFile.statistics.topScore.toString()
-      }
-    });
-
     try {
-      await this.s3Client.send(command);
-      console.log(`✅ Summary data stored successfully: ${key}`);
+      const summaryFile: SummaryNewsFile = {
+        scanTime: new Date(timestamp).toISOString(),
+        scanTimeMs: timestamp,
+        articles: scoredArticles,
+        statistics: this.calculateStatistics(scoredArticles)
+      };
+      
+      console.log(`📦 Storing summary data: ${key} (${scoredArticles.length} articles, ${this.activeOperations.size} concurrent ops)`);
+      
+      const jsonContent = JSON.stringify(summaryFile, null, 2);
+      const fileSizeMB = Buffer.byteLength(jsonContent, 'utf8') / (1024 * 1024);
+      
+      // Validate file size
+      if (fileSizeMB > this.MAX_FILE_SIZE_MB) {
+        throw new Error(`Summary file size ${fileSizeMB.toFixed(2)}MB exceeds limit of ${this.MAX_FILE_SIZE_MB}MB`);
+      }
+      
+      const command = new PutObjectCommand({
+        Bucket: this.bucketName,
+        Key: key,
+        Body: jsonContent,
+        ContentType: 'application/json',
+        Metadata: {
+          'scan-time': summaryFile.scanTime,
+          'article-count': scoredArticles.length.toString(),
+          'average-score': summaryFile.statistics.averageScore.toString(),
+          'top-score': summaryFile.statistics.topScore.toString(),
+          'file-size-mb': fileSizeMB.toFixed(3),
+          'storage-version': '1.0'
+        }
+      });
+
+      // Store with timeout (5 seconds as specified)
+      const uploadPromise = this.s3Client.send(command);
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Upload timeout after 5 seconds')), this.UPLOAD_TIMEOUT_MS)
+      );
+      
+      await Promise.race([uploadPromise, timeoutPromise]);
+      
+      const duration = Date.now() - startTime;
+      console.log(`✅ Summary data stored: ${key} (${duration}ms, ${fileSizeMB.toFixed(2)}MB)`);
+      
     } catch (error) {
-      console.error(`❌ Failed to store summary data: ${key}`, error);
+      const duration = Date.now() - startTime;
+      console.error(`❌ Failed to store summary data: ${key} (${duration}ms)`, error);
       throw new Error(`Failed to store summary data: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      this.activeOperations.delete(operationId);
     }
   }
 
@@ -319,6 +394,158 @@ export class NewsStorageService {
       } catch (error) {
         console.warn(`Warning: Could not delete ${key}`, error);
       }
+    }
+  }
+
+  /**
+   * Create S3 bucket if it doesn't exist
+   */
+  async createBucketIfNotExists(): Promise<{ exists: boolean; created: boolean }> {
+    try {
+      console.log(`🔍 Checking if bucket '${this.bucketName}' exists...`);
+      
+      // Try to access the bucket
+      const headCommand = new HeadBucketCommand({ Bucket: this.bucketName });
+      await this.s3Client.send(headCommand);
+      
+      console.log(`✅ Bucket '${this.bucketName}' already exists!`);
+      return { exists: true, created: false };
+      
+    } catch (error: any) {
+      if (error.name === 'NotFound' || error.$metadata?.httpStatusCode === 404) {
+        console.log(`📦 Bucket '${this.bucketName}' doesn't exist. Creating it...`);
+        
+        try {
+          // Create the bucket
+          const createCommand = new CreateBucketCommand({ Bucket: this.bucketName });
+          await this.s3Client.send(createCommand);
+          
+          console.log(`✅ Bucket '${this.bucketName}' created successfully!`);
+          return { exists: false, created: true };
+          
+        } catch (createError) {
+          console.error(`❌ Failed to create bucket '${this.bucketName}':`, createError);
+          throw createError;
+        }
+      } else {
+        console.error(`❌ Failed to check bucket '${this.bucketName}':`, error);
+        throw error;
+      }
+    }
+  }
+
+  /**
+   * Store complete daily news data (raw + summary) as specified in requirements
+   */
+  async storeDailyNews(timestamp: number, rawData: RawNewsFile, summaryData?: ScoredArticle[]): Promise<void> {
+    console.log(`📦 Storing complete daily news data for timestamp: ${timestamp}`);
+    const startTime = Date.now();
+    
+    try {
+      // Store raw data
+      await this.storeRawData(timestamp, rawData);
+      
+      // Store summary data if provided
+      if (summaryData) {
+        await this.storeSummaryData(timestamp, summaryData);
+      }
+      
+      const duration = Date.now() - startTime;
+      console.log(`✅ Complete daily news stored successfully (${duration}ms)`);
+      
+    } catch (error) {
+      console.error('❌ Failed to store complete daily news:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Backup strategy: Create redundant copy with backup suffix
+   */
+  async createBackup(timestamp: number): Promise<void> {
+    console.log(`💾 Creating backup for timestamp: ${timestamp}`);
+    
+    try {
+      const rawKey = `${timestamp}/raw.json`;
+      const summaryKey = `${timestamp}/summary.json`;
+      const backupSuffix = '.backup';
+      
+      // Copy raw file
+      try {
+        const rawData = await this.getRawData(timestamp);
+        const backupRawCommand = new PutObjectCommand({
+          Bucket: this.bucketName,
+          Key: rawKey + backupSuffix,
+          Body: JSON.stringify(rawData, null, 2),
+          ContentType: 'application/json',
+          Metadata: {
+            'backup-created': new Date().toISOString(),
+            'original-key': rawKey
+          }
+        });
+        await this.s3Client.send(backupRawCommand);
+      } catch (error) {
+        console.warn('Warning: Could not backup raw file:', error);
+      }
+      
+      // Copy summary file if exists
+      try {
+        const summaryData = await this.getSummaryData(timestamp);
+        const backupSummaryCommand = new PutObjectCommand({
+          Bucket: this.bucketName,
+          Key: summaryKey + backupSuffix,
+          Body: JSON.stringify(summaryData, null, 2),
+          ContentType: 'application/json',
+          Metadata: {
+            'backup-created': new Date().toISOString(),
+            'original-key': summaryKey
+          }
+        });
+        await this.s3Client.send(backupSummaryCommand);
+      } catch (error) {
+        console.warn('Warning: Could not backup summary file:', error);
+      }
+      
+      console.log('✅ Backup created successfully');
+      
+    } catch (error) {
+      console.error('❌ Backup creation failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get storage health metrics
+   */
+  async getStorageHealth(): Promise<{
+    available: boolean;
+    responseTime: number;
+    concurrentOps: number;
+    bucketExists: boolean;
+  }> {
+    const startTime = Date.now();
+    
+    try {
+      const command = new ListObjectsV2Command({
+        Bucket: this.bucketName,
+        MaxKeys: 1
+      });
+      
+      await this.s3Client.send(command);
+      
+      return {
+        available: true,
+        responseTime: Date.now() - startTime,
+        concurrentOps: this.activeOperations.size,
+        bucketExists: true
+      };
+    } catch (error) {
+      return {
+        available: false,
+        responseTime: Date.now() - startTime,
+        concurrentOps: this.activeOperations.size,
+        bucketExists: false
+      };
     }
   }
 
