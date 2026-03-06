@@ -1,11 +1,12 @@
 import * as cron from 'node-cron';
 import { NewsAPIService } from './newsapi';
-import { NewsStorageService } from './s3storage';
+import { NewsStorageService, type SummaryNewsFile, type ScoredArticle } from './s3storage';
+import { ScoringService, type ArticleInput } from './scoring';
 
 export interface SchedulerConfig {
   timezone: string;
   enabled: boolean;
-  cronExpression: string; // '0 8 * * *' for 8am daily
+  cronExpression: string;
   maxRetries: number;
   notificationWebhook?: string;
 }
@@ -15,6 +16,9 @@ export interface ScheduledJobResult {
   timestamp: number;
   duration: number;
   articlesProcessed: number;
+  articlesScored: number;
+  skippedRaw: boolean;
+  skippedSummary: boolean;
   errors?: string[];
   nextRun?: Date;
 }
@@ -22,41 +26,37 @@ export interface ScheduledJobResult {
 export class NewsScheduler {
   private newsApi: NewsAPIService;
   private storage: NewsStorageService;
+  private scoring: ScoringService;
   private config: SchedulerConfig;
   private currentJob?: cron.ScheduledTask;
-  private isRunning: boolean = false;
+  private isRunning = false;
   private lastResult?: ScheduledJobResult;
 
   constructor(config?: Partial<SchedulerConfig>) {
     this.newsApi = new NewsAPIService();
     this.storage = new NewsStorageService();
-    
+    this.scoring = new ScoringService();
+
     this.config = {
       timezone: 'America/Los_Angeles',
       enabled: process.env.PIPELINE_ENABLED === 'true',
-      cronExpression: '0 8 * * *', // 8am daily LA time
+      cronExpression: '0 8 * * *',
       maxRetries: 3,
-      ...config
+      ...config,
     };
 
     console.log(`📅 Scheduler initialized: ${this.config.cronExpression} (${this.config.timezone})`);
   }
 
-  /**
-   * Start the scheduled news fetching (8am LA time daily)
-   */
   start(): void {
     if (this.currentJob) {
       console.log('⚠️ Scheduler already running');
       return;
     }
-
     if (!this.config.enabled) {
       console.log('📅 Scheduler disabled via config');
       return;
     }
-
-    console.log(`🚀 Starting scheduler: ${this.config.cronExpression} in ${this.config.timezone}`);
 
     this.currentJob = cron.schedule(
       this.config.cronExpression,
@@ -65,25 +65,15 @@ export class NewsScheduler {
           console.log('⚠️ Previous job still running, skipping...');
           return;
         }
-
-        console.log('🗞️ Scheduled news fetch triggered at', new Date().toLocaleString('en-US', {
-          timeZone: this.config.timezone
-        }));
-
+        console.log('🗞️ Scheduled fetch triggered at', new Date().toLocaleString('en-US', { timeZone: this.config.timezone }));
         await this.executeScheduledFetch();
       },
-      {
-        scheduled: true,
-        timezone: this.config.timezone
-      }
+      { scheduled: true, timezone: this.config.timezone }
     );
 
-    console.log('✅ Scheduler started successfully');
+    console.log('✅ Scheduler started');
   }
 
-  /**
-   * Stop the scheduler
-   */
   stop(): void {
     if (this.currentJob) {
       this.currentJob.stop();
@@ -92,44 +82,143 @@ export class NewsScheduler {
     }
   }
 
-  /**
-   * Execute the scheduled news fetch with full error handling
-   */
+  async triggerManualFetch(): Promise<ScheduledJobResult> {
+    if (this.isRunning) throw new Error('A job is currently running');
+    console.log('🔧 Manual fetch triggered');
+    return this.executeScheduledFetch();
+  }
+
+  getStatus() {
+    return {
+      isRunning: this.isRunning,
+      isScheduled: !!this.currentJob,
+      nextRun: this.getNextRunDate(),
+      lastResult: this.lastResult,
+      config: this.config,
+    };
+  }
+
+  updateConfig(newConfig: Partial<SchedulerConfig>): void {
+    const wasRunning = !!this.currentJob;
+    if (wasRunning) this.stop();
+    this.config = { ...this.config, ...newConfig };
+    if (wasRunning && this.config.enabled) this.start();
+    console.log('🔄 Scheduler config updated');
+  }
+
+  // ─── Core Pipeline ───────────────────────────────────────────────────────────
+
   private async executeScheduledFetch(): Promise<ScheduledJobResult> {
     const startTime = Date.now();
-    const timestamp = this.getToday8amLATimestamp();
-    
+    const timestamp = this.newsApi.getToday8amLATimestamp();
     this.isRunning = true;
 
+    let skippedRaw = false;
+    let skippedSummary = false;
+    let articlesProcessed = 0;
+    let articlesScored = 0;
+
     try {
-      console.log(`📡 Starting scheduled fetch for timestamp: ${timestamp}`);
+      // ── Step 0: Check what already exists ────────────────────────────────────
+      const existing = await this.storage.checkDayExists(timestamp);
+      console.log(`🔍 Existing data for ${timestamp}: raw=${existing.hasRaw}, summary=${existing.hasSummary}`);
 
-      // Step 1: Fetch news from APIs
-      const rawData = await this.newsApi.fetchDailyNews();
+      if (existing.hasRaw && existing.hasSummary) {
+        console.log('✅ Both raw and summary already exist for today — skipping all steps');
+        skippedRaw = true;
+        skippedSummary = true;
+        const summary = await this.storage.getSummaryData(timestamp);
+        articlesProcessed = summary.totalArticlesInRaw;
+        articlesScored = summary.totalArticlesScored;
+      } else {
+        // ── Step 1: Fetch + save raw.json ───────────────────────────────────────
+        let rawData;
+        if (existing.hasRaw) {
+          console.log('⏭️  raw.json already exists — loading from S3');
+          rawData = await this.storage.getRawData(timestamp);
+          skippedRaw = true;
+        } else {
+          console.log('📡 Step 1: Fetching articles from NewsAPI...');
+          rawData = await this.newsApi.fetchDailyNews();
 
-      if (rawData.apiResponse.status !== 'ok') {
-        throw new Error(`News API fetch failed: ${rawData.apiResponse.message}`);
+          if (rawData.apiResponse.status !== 'ok') {
+            throw new Error(`NewsAPI fetch failed: ${rawData.apiResponse.message}`);
+          }
+
+          await this.storage.storeRawData(timestamp, rawData);
+          console.log(`✅ Step 1 done: ${rawData.apiResponse.articles.length} articles stored in raw.json`);
+        }
+
+        articlesProcessed = rawData.apiResponse.articles.length;
+
+        // ── Step 2: Score + save summary.json ──────────────────────────────────
+        if (existing.hasSummary) {
+          console.log('⏭️  summary.json already exists — skipping scoring');
+          skippedSummary = true;
+          const summary = await this.storage.getSummaryData(timestamp);
+          articlesScored = summary.totalArticlesScored;
+        } else {
+          console.log('🤖 Step 2: Scoring articles via OpenAI...');
+
+          const articleInputs: ArticleInput[] = rawData.apiResponse.articles.map(a => ({
+            id: a.articleId,
+            title: a.title,
+            description: a.description ?? '',
+            content: a.content,
+            publishedAt: a.publishedAt,
+            source: a.source.name,
+            // url intentionally omitted — not sent to OpenAI
+          }));
+
+          const scoringResult = await this.scoring.scoreDailyArticles(articleInputs);
+
+          // Map scoring output → ScoredArticle (no URL)
+          const scoredArticles: ScoredArticle[] = scoringResult.allScores.map(s => ({
+            articleId: s.id,
+            title: s.title,
+            description: rawData.apiResponse.articles.find(a => a.articleId === s.id)?.description ?? '',
+            source: rawData.apiResponse.articles.find(a => a.articleId === s.id)?.source.name ?? '',
+            publishedAt: rawData.apiResponse.articles.find(a => a.articleId === s.id)?.publishedAt ?? '',
+            scores: s.scores,
+            total: s.total,
+            reasoning: s.reasoning,
+            tags: s.tags,
+          }));
+
+          // Sort by total score descending
+          scoredArticles.sort((a, b) => b.total - a.total);
+
+          const summaryFile: SummaryNewsFile = {
+            scanTime: rawData.scanTime,
+            scanTimeMs: timestamp,
+            generatedAt: new Date().toISOString(),
+            model: process.env.OPENAI_MODEL ?? 'gpt-4o-mini',
+            totalArticlesInRaw: rawData.apiResponse.articles.length,
+            totalArticlesScored: scoredArticles.length,
+            articles: scoredArticles,
+          };
+
+          await this.storage.storeSummaryData(timestamp, summaryFile);
+          articlesScored = scoredArticles.length;
+          console.log(`✅ Step 2 done: ${articlesScored} articles scored and saved in summary.json`);
+        }
       }
-
-      // Step 2: Store raw data immediately
-      await this.storage.storeRawData(timestamp, rawData);
 
       const result: ScheduledJobResult = {
         success: true,
         timestamp,
         duration: Date.now() - startTime,
-        articlesProcessed: rawData.apiResponse.articles.length,
-        nextRun: this.getNextRunDate()
+        articlesProcessed,
+        articlesScored,
+        skippedRaw,
+        skippedSummary,
+        nextRun: this.getNextRunDate(),
       };
 
       this.lastResult = result;
-      console.log(`✅ Scheduled fetch completed successfully (${result.duration}ms, ${result.articlesProcessed} articles)`);
+      console.log(`🎉 Pipeline complete (${result.duration}ms) — raw: ${skippedRaw ? 'skipped' : 'done'}, summary: ${skippedSummary ? 'skipped' : 'done'}`);
 
-      // Optional: Send success notification
-      if (this.config.notificationWebhook) {
-        await this.sendNotification(result);
-      }
-
+      if (this.config.notificationWebhook) await this.sendNotification(result);
       return result;
 
     } catch (error) {
@@ -137,151 +226,43 @@ export class NewsScheduler {
         success: false,
         timestamp,
         duration: Date.now() - startTime,
-        articlesProcessed: 0,
+        articlesProcessed,
+        articlesScored,
+        skippedRaw,
+        skippedSummary,
         errors: [error instanceof Error ? error.message : 'Unknown error'],
-        nextRun: this.getNextRunDate()
+        nextRun: this.getNextRunDate(),
       };
 
       this.lastResult = result;
-      console.error(`❌ Scheduled fetch failed (${result.duration}ms):`, error);
+      console.error(`❌ Pipeline failed (${result.duration}ms):`, error);
 
-      // Optional: Send failure notification
-      if (this.config.notificationWebhook) {
-        await this.sendNotification(result);
-      }
-
+      if (this.config.notificationWebhook) await this.sendNotification(result);
       return result;
-
     } finally {
       this.isRunning = false;
     }
   }
 
-  /**
-   * Get the next scheduled run date
-   */
-  private getNextRunDate(): Date {
-    if (!this.currentJob) {
-      return new Date();
-    }
+  // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-    // Calculate next 8am LA time
-    const now = new Date();
-    const tomorrow = new Date(now);
+  private getNextRunDate(): Date {
+    const tomorrow = new Date();
     tomorrow.setDate(tomorrow.getDate() + 1);
     tomorrow.setHours(8, 0, 0, 0);
-
-    // Convert to LA timezone
-    const laTime = new Date(tomorrow.toLocaleString('en-US', {
-      timeZone: this.config.timezone
-    }));
-
-    return laTime;
+    return tomorrow;
   }
 
-  /**
-   * Get today's 8am LA timestamp (matches NewsAPI service)
-   */
-  private getToday8amLATimestamp(): number {
-    const now = new Date();
-    const la8am = new Date(now);
-    la8am.setHours(8, 0, 0, 0);
-
-    // Handle Pacific Time (PST/PDT)
-    const month = now.getMonth() + 1;
-    const isDST = month >= 3 && month <= 11;
-    const offset = isDST ? 7 : 8; // UTC-7 or UTC-8
-    const utc8am = new Date(la8am.getTime() + (offset * 60 * 60 * 1000));
-
-    return utc8am.getTime();
-  }
-
-  /**
-   * Send notification webhook (optional)
-   */
   private async sendNotification(result: ScheduledJobResult): Promise<void> {
     if (!this.config.notificationWebhook) return;
-
     try {
-      const payload = {
-        success: result.success,
-        timestamp: result.timestamp,
-        articlesProcessed: result.articlesProcessed,
-        duration: `${result.duration}ms`,
-        nextRun: result.nextRun?.toISOString(),
-        errors: result.errors,
-        service: 'NewsLaw-Scheduler'
-      };
-
-      const response = await fetch(this.config.notificationWebhook, {
+      await fetch(this.config.notificationWebhook, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...result, service: 'NewsClaw-Scheduler' }),
       });
-
-      if (!response.ok) {
-        throw new Error(`Webhook failed: ${response.status}`);
-      }
-
-      console.log('✅ Notification sent successfully');
-
     } catch (error) {
       console.error('❌ Failed to send notification:', error);
     }
-  }
-
-  /**
-   * Trigger manual fetch (for testing)
-   */
-  async triggerManualFetch(): Promise<ScheduledJobResult> {
-    if (this.isRunning) {
-      throw new Error('A scheduled job is currently running');
-    }
-
-    console.log('🔧 Manual fetch triggered');
-    return await this.executeScheduledFetch();
-  }
-
-  /**
-   * Get scheduler status
-   */
-  getStatus(): {
-    isRunning: boolean;
-    isScheduled: boolean;
-    nextRun?: Date;
-    lastResult?: ScheduledJobResult;
-    config: SchedulerConfig;
-  } {
-    return {
-      isRunning: this.isRunning,
-      isScheduled: !!this.currentJob,
-      nextRun: this.getNextRunDate(),
-      lastResult: this.lastResult,
-      config: this.config
-    };
-  }
-
-  /**
-   * Update scheduler configuration
-   */
-  updateConfig(newConfig: Partial<SchedulerConfig>): void {
-    const wasRunning = !!this.currentJob;
-    
-    // Stop current scheduler
-    if (wasRunning) {
-      this.stop();
-    }
-
-    // Update config
-    this.config = { ...this.config, ...newConfig };
-    
-    // Restart if it was running
-    if (wasRunning && this.config.enabled) {
-      this.start();
-    }
-
-    console.log('🔄 Scheduler configuration updated');
   }
 }

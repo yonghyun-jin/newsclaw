@@ -1,7 +1,9 @@
 import axios from 'axios';
 
-// NewsAPI interfaces
+// ─── Interfaces ───────────────────────────────────────────────────────────────
+
 export interface NewsAPIArticle {
+  articleId: string; // index string — used to cross-reference summary.json
   title: string;
   description: string;
   url: string;
@@ -33,17 +35,18 @@ export interface RawNewsFile {
     errors?: string[];
     attempt?: number;
     rateLimitHit?: boolean;
-    strategy?: string;          // 'latest-6-hours'
-    timeWindow?: string;        // '6-hours' 
-    targetArticles?: number;    // 50
+    strategy?: string;
+    timeWindow?: string;
+    targetArticles?: number;
   };
 }
+
+// ─── Service ──────────────────────────────────────────────────────────────────
 
 export class NewsAPIService {
   private apiKey: string;
   private baseUrl: string;
 
-  // NewsAPI source IDs that work on the free plan with /top-headlines
   private readonly TOP_HEADLINE_SOURCES = [
     'associated-press',
     'cbs-news',
@@ -76,85 +79,47 @@ export class NewsAPIService {
     const scanTimeMs = this.getToday8amLATimestamp();
     const errors: string[] = [];
 
-    console.log('🗞️ Starting OPTIMIZED daily news fetch (50 articles max)...');
-    console.log('⏰ Target: Last 6 hours of articles (2am-8am LA time)');
+    console.log('🗞️ Starting daily news fetch (50 articles, last 6h)...');
 
     for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
       try {
         console.log(`🔄 Attempt ${attempt}/${this.MAX_RETRIES}`);
 
-        // SINGLE STRATEGY: Get 50 LATEST articles from last 6 hours
-        const latestResults = await this.fetchLatestArticles(50);
-        console.log(`📰 Latest articles returned: ${latestResults.articles.length} from last 6 hours`);
+        const result = await this.fetchLatestArticles(50);
+        console.log(`📰 Fetched ${result.articles.length} articles`);
 
         const fetchDuration = Date.now() - startTime;
-        console.log(`✅ Success on attempt ${attempt}: ${latestResults.articles.length} articles in ${fetchDuration}ms`);
 
         return {
           scanTime,
           scanTimeMs,
           apiResponse: {
             status: 'ok',
-            totalResults: latestResults.totalResults,
-            articles: latestResults.articles
+            totalResults: result.totalResults,
+            articles: result.articles,
           },
           metadata: {
             fetchDuration,
             sourcesQueried: this.TOP_HEADLINE_SOURCES,
-            articlesPerSource: this.countArticlesBySource(latestResults.articles),
+            articlesPerSource: this.countArticlesBySource(result.articles),
             errors,
             attempt,
             rateLimitHit: false,
             strategy: 'latest-6-hours',
-            timeWindow: '6-hours',
-            targetArticles: 50
-          }
-        };
-
-        // Merge, deduplicate by URL, cap at 100
-        const merged = deduplicateByUrl([
-          ...headlineResults.articles,
-          ...everythingResults.articles,
-        ]).slice(0, 100);
-
-        const fetchDuration = Date.now() - startTime;
-        console.log(`✅ Attempt ${attempt} success: ${merged.length} articles in ${fetchDuration}ms`);
-
-        return {
-          scanTime,
-          scanTimeMs,
-          apiResponse: {
-            status: 'ok',
-            totalResults: merged.length,
-            articles: merged,
-          },
-          metadata: {
-            fetchDuration,
-            sourcesQueried: this.TOP_HEADLINE_SOURCES,
-            articlesPerSource: this.countArticlesBySource(merged),
-            errors,
-            attempt,
-            rateLimitHit: false,
-            debug: {
-              topHeadlinesCount: headlineResults.articles.length,
-              everythingCount: everythingResults.articles.length,
-              plan: 'developer',
-            },
+            timeWindow: '6h',
+            targetArticles: 50,
           },
         };
       } catch (error) {
         const msg = error instanceof Error ? error.message : 'Unknown error';
         errors.push(`Attempt ${attempt}: ${msg}`);
         console.warn(`⚠️ Attempt ${attempt} failed: ${msg}`);
-
-        if (attempt < this.MAX_RETRIES) {
-          await this.sleep(this.RETRY_DELAY_MS);
-        }
+        if (attempt < this.MAX_RETRIES) await this.sleep(this.RETRY_DELAY_MS);
       }
     }
 
     const fetchDuration = Date.now() - startTime;
-    console.error('❌ All fetch attempts failed. Errors:', errors);
+    console.error('❌ All fetch attempts failed:', errors);
 
     return {
       scanTime,
@@ -172,29 +137,24 @@ export class NewsAPIService {
   }
 
   /**
-   * OPTIMIZED: Fetch the 50 LATEST articles from last 6 hours
-   * Perfect for daily 8am runs - gets 2am-8am LA time articles
+   * Fetch the 50 latest articles from the past 6 hours.
+   * Assigns articleId as a string index for cross-referencing with summary.json.
    */
   private async fetchLatestArticles(targetCount: number): Promise<NewsAPIResponse> {
-    const url = `${this.baseUrl}/everything`;
-    
-    // Get articles from last 6 hours (2am-8am if run at 8am)
-    const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
-    
+    const from = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
+
     const params = {
       sources: this.TOP_HEADLINE_SOURCES.join(','),
-      sortBy: 'publishedAt',        // 👈 LATEST first
-      pageSize: targetCount,        // 👈 Exactly 50 articles
+      sortBy: 'publishedAt',
+      pageSize: targetCount,
       language: 'en',
-      from: sixHoursAgo,           // 👈 Last 6 hours only
-      apiKey: this.apiKey
+      from,
+      apiKey: this.apiKey,
     };
 
-    console.log('📡 Fetching LATEST articles from:', this.TOP_HEADLINE_SOURCES.join(', '));
-    console.log('⏰ Time window:', sixHoursAgo, '→', new Date().toISOString());
-    console.log('🎯 Target articles:', targetCount);
+    console.log(`📡 Fetching /everything | from: ${from}`);
 
-    const response = await axios.get<NewsAPIResponse>(url, {
+    const response = await axios.get<NewsAPIResponse>(`${this.baseUrl}/everything`, {
       params,
       timeout: this.REQUEST_TIMEOUT_MS,
     });
@@ -203,52 +163,46 @@ export class NewsAPIService {
       throw new Error(`NewsAPI error: ${response.data.code} — ${response.data.message}`);
     }
 
-    // Sort articles by publishedAt descending to ensure we get the absolute latest
-    const sortedArticles = response.data.articles.sort((a, b) => 
-      new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime()
-    );
+    // Sort latest first, assign articleId as stable index string
+    const sorted = response.data.articles
+      .sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime())
+      .slice(0, targetCount)
+      .map((article, i) => ({ ...article, articleId: String(i) }));
 
-    console.log(`📊 Received ${response.data.articles.length} articles, returning ${Math.min(targetCount, sortedArticles.length)} latest`);
-    
-    return {
-      ...response.data,
-      articles: sortedArticles.slice(0, targetCount) // Take only the latest N articles
-    };
+    console.log(`📊 Returning ${sorted.length} articles`);
+    return { ...response.data, articles: sorted };
   }
 
-  // Removed old fetchEverything method - now using fetchLatestArticles only
-
   /**
-   * Manual fetch for testing — uses same 6-hour latest strategy
+   * Manual fetch for testing — /top-headlines, assigns articleId.
    */
-  async fetchNewsManual(sources?: string[], pageSize = 10): Promise<NewsAPIResponse> {
-    console.log('🔧 Manual fetch using 6-hour strategy...');
-    
-    const url = `${this.baseUrl}/everything`;
-    const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
-    
+  async fetchNewsManual(sources?: string[], pageSize = 20): Promise<NewsAPIResponse> {
     const params = {
       sources: (sources ?? this.TOP_HEADLINE_SOURCES).join(','),
-      sortBy: 'publishedAt',       // Latest first
       pageSize,
-      language: 'en',
-      from: sixHoursAgo,          // Last 6 hours
-      apiKey: this.apiKey
+      apiKey: this.apiKey,
     };
 
-    console.log(`📡 Manual query: ${pageSize} articles from last 6 hours`);
-    console.log(`⏰ Time window: ${sixHoursAgo} → ${new Date().toISOString()}`);
+    console.log('🔧 Manual fetch via /top-headlines, pageSize:', pageSize);
 
-    const response = await axios.get<NewsAPIResponse>(url, { params, timeout: this.REQUEST_TIMEOUT_MS });
+    const response = await axios.get<NewsAPIResponse>(`${this.baseUrl}/top-headlines`, {
+      params,
+      timeout: this.REQUEST_TIMEOUT_MS,
+    });
 
     if (response.data.status === 'error') {
       throw new Error(`NewsAPI error: ${response.data.code} — ${response.data.message}`);
     }
 
-    return response.data;
+    return {
+      ...response.data,
+      articles: response.data.articles.map((a, i) => ({ ...a, articleId: String(i) })),
+    };
   }
 
-  private getToday8amLATimestamp(): number {
+  // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+  getToday8amLATimestamp(): number {
     const now = new Date();
     const la8am = new Date(now);
     la8am.setHours(8, 0, 0, 0);
@@ -273,13 +227,4 @@ export class NewsAPIService {
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
-}
-
-function deduplicateByUrl(articles: NewsAPIArticle[]): NewsAPIArticle[] {
-  const seen = new Set<string>();
-  return articles.filter(a => {
-    if (seen.has(a.url)) return false;
-    seen.add(a.url);
-    return true;
-  });
 }
